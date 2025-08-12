@@ -2,6 +2,8 @@ name: Build and Release native binaries
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
