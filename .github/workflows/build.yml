@@ -1,0 +1,43 @@
+name: Build and Release native binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '21'
+          distribution: 'graalvm-community'
+          components: 'native-image'
+
+      - name: Compile Java
+        run: javac AzmaGall.java
+
+      - name: Build native image
+        run: |
+          native-image \
+            --no-fallback \
+            -O3 \
+            -H:Name=azmagall-${{ matrix.os }} \
+            AzmaGall
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: azmagall-${{ matrix.os }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
