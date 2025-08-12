@@ -11,6 +11,7 @@ jobs:
   build:
     name: Build ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -26,6 +27,8 @@ jobs:
           distribution: 'graalvm-community'
           components: 'native-image'
 
+      - run: echo "GITHUB_REF=$GITHUB_REF"
+
       - name: Compile Java
         run: javac AzmaGall.java
 
@@ -38,6 +41,7 @@ jobs:
             AzmaGall
 
       - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: azmagall-${{ matrix.os }}
