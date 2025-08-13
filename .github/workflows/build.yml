@@ -3,12 +3,13 @@ name: Build and Release
 on:
   push:
     tags:
-      - 'v*'  # Spustí se při push tagu jako v1.0.0
-  workflow_dispatch:  # Možnost spustit ručně
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         include:
@@ -42,22 +43,25 @@ jobs:
       if: matrix.platform == 'linux'
       run: |
         native-image --no-fallback \
-          --static \
           -jar azmagall.jar \
-          -H:Name=${{ matrix.binary_name }} \
-          -H:+ReportExceptionStackTraces
+          -o ${{ matrix.binary_name }} \
+          -H:+ReportExceptionStackTraces \
+          -H:+UnlockExperimentalVMOptions \
+          --enable-preview
 
     - name: Build native image (macOS)
       if: matrix.platform == 'macos'
       run: |
         native-image --no-fallback \
           -jar azmagall.jar \
-          -H:Name=${{ matrix.binary_name }} \
-          -H:+ReportExceptionStackTraces
+          -o ${{ matrix.binary_name }} \
+          -H:+ReportExceptionStackTraces \
+          -H:+UnlockExperimentalVMOptions \
+          --enable-preview
 
     - name: Test binary
       run: |
-        ./${{ matrix.binary_name }} || true  # Test že se spustí (očekáváme chybu kvůli chybějícím argumentům)
+        ./${{ matrix.binary_name }} || true
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
