@@ -1,62 +1,44 @@
-/*
-AzmaGall - simple static photo gallery generator (Native Image compatible)
-Author: ChatGPT (for Jan) - Modified for GraalVM native-image
-
-Key changes for native-image compatibility:
-- Added AWT initialization flags for build process
-- Robust error handling for image processing
-- Fallback mechanisms when native libraries fail
-
-Usage:
-  java AzmaGall /path/to/images "Gallery Title"
-
-Build native:
-  javac AzmaGall.java
-  jar cfe azmagall.jar AzmaGall AzmaGall.class
-  native-image --no-fallback \
-    -jar azmagall.jar \
-    -H:Name=azmagall \
-    -H:+ReportExceptionStackTraces \
-    --initialize-at-build-time=java.awt.Toolkit \
-    --initialize-at-build-time=java.awt.GraphicsEnvironment \
-    --initialize-at-build-time=sun.awt.FontConfiguration \
-    --initialize-at-build-time=sun.java2d.FontSupport
-
-*/
-
-import java.awt.Graphics2D;
-import java.awt.Image;
-import java.awt.image.BufferedImage;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
-import javax.imageio.ImageIO;
 
 public class AzmaGall {
-    private static final int THUMB_WIDTH = 320;
-    private static final String[] EXT = {"jpg", "jpeg", "png"};
+    private static final String[] EXT = {"jpg", "jpeg", "png", "gif", "webp"};
+    private static boolean useExternalThumbs = false;
 
     public static void main(String[] args) throws Exception {
         if (args.length < 1) {
             System.out.println("Usage: java AzmaGall /path/to/images [\"Gallery Title\"]");
+            System.out.println("Options:");
+            System.out.println("  --external-thumbs  Use external tools for thumbnail generation");
             return;
         }
-        Path src = Paths.get(args[0]);
+
+        List<String> argList = new ArrayList<>(Arrays.asList(args));
+        if (argList.contains("--external-thumbs")) {
+            useExternalThumbs = true;
+            argList.remove("--external-thumbs");
+        }
+
+        if (argList.isEmpty()) {
+            System.err.println("Error: No source directory specified");
+            return;
+        }
+
+        Path src = Paths.get(argList.get(0));
         if (!Files.exists(src) || !Files.isDirectory(src)) {
             System.err.println("Error: source path doesn't exist or is not a directory: " + src);
             return;
         }
-        String title = args.length >= 2 ? args[1] : "My Photo Gallery";
+        String title = argList.size() >= 2 ? argList.get(1) : "My Photo Gallery";
 
         Path out = Paths.get("gallery");
         Path imagesOut = out.resolve("images");
         Path thumbsOut = out.resolve("thumbs");
 
-        // Create output dirs
         Files.createDirectories(imagesOut);
         Files.createDirectories(thumbsOut);
 
-        // Gather image files
         List<Path> files = new ArrayList<>();
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(src)) {
             for (Path p : ds) {
@@ -73,6 +55,11 @@ public class AzmaGall {
         files.sort(Comparator.comparing(p -> p.getFileName().toString(), String.CASE_INSENSITIVE_ORDER));
 
         System.out.println("Found " + files.size() + " images. Processing...");
+        if (useExternalThumbs) {
+            System.out.println("Using external tools for thumbnail generation...");
+        } else {
+            System.out.println("Using CSS-based thumbnails (copying originals)...");
+        }
 
         List<String> galleryItems = new ArrayList<>();
         int idx = 0;
@@ -82,25 +69,22 @@ public class AzmaGall {
             Path dstImage = imagesOut.resolve(safeName);
             Path dstThumb = thumbsOut.resolve(safeName);
 
-            // copy original if not exists
             if (!Files.exists(dstImage)) {
                 Files.copy(f, dstImage, StandardCopyOption.REPLACE_EXISTING);
             }
 
-            // make thumbnail
             if (!Files.exists(dstThumb)) {
-                try {
-                    makeThumb(dstImage.toFile(), dstThumb.toFile(), THUMB_WIDTH);
-                } catch (Exception e) {
-                    System.err.println("Failed to make thumb for " + f + ": " + e.getMessage());
-                    System.err.println("Falling back to copying original as thumbnail...");
-                    // fallback: copy original as thumb
-                    try {
-                        Files.copy(dstImage, dstThumb, StandardCopyOption.REPLACE_EXISTING);
-                    } catch (IOException copyEx) {
-                        System.err.println("Fallback copy also failed: " + copyEx.getMessage());
-                        continue; // Skip this image
+                boolean thumbCreated = false;
+
+                if (useExternalThumbs) {
+                    thumbCreated = makeExternalThumb(dstImage, dstThumb);
+                    if (thumbCreated) {
+                        System.out.println("Created thumbnail using external tool: " + safeName);
                     }
+                }
+
+                if (!thumbCreated) {
+                    Files.copy(dstImage, dstThumb, StandardCopyOption.REPLACE_EXISTING);
                 }
             }
 
@@ -108,18 +92,18 @@ public class AzmaGall {
             if (idx % 10 == 0) System.out.println("Processed " + idx + " / " + files.size());
         }
 
-        if (galleryItems.isEmpty()) {
-            System.err.println("No images could be processed successfully.");
-            return;
-        }
-
-        // write static assets
         writeResource(out.resolve("style.css"), styleCss());
         writeResource(out.resolve("script.js"), scriptJs());
         writeIndexHtml(out.resolve("index.html"), title, galleryItems);
 
         System.out.println("Gallery generated in: " + out.toAbsolutePath());
         System.out.println("Open " + out.resolve("index.html").toString() + " in a browser or upload the folder to a static host.");
+
+        if (!useExternalThumbs) {
+            System.out.println();
+            System.out.println("Note: Using CSS-based thumbnails. For better performance with large images,");
+            System.out.println("consider installing ImageMagick and using --external-thumbs option.");
+        }
     }
 
     private static boolean hasExt(String name) {
@@ -129,75 +113,43 @@ public class AzmaGall {
     }
 
     private static String sanitizeFilename(String name) {
-        // basic sanitization: remove path separators and control chars
         return name.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]+", "_");
     }
 
-    private static void makeThumb(File src, File dst, int width) throws IOException {
-        BufferedImage img;
-        try {
-            img = ImageIO.read(src);
-        } catch (Exception e) {
-            throw new IOException("Failed to read image: " + src.getName() + " - " + e.getMessage(), e);
+    private static boolean makeExternalThumb(Path src, Path dst) {
+        if (tryCommand(new String[]{
+                "convert", src.toString(), "-resize", "320x320>", "-quality", "85", dst.toString()
+        })) {
+            return true;
         }
-        
-        if (img == null) {
-            throw new IOException("Unsupported image format or corrupted file: " + src.getName());
-        }
-        
-        int w = img.getWidth();
-        int h = img.getHeight();
-        
-        if (w <= width) {
-            // just copy - no resize needed
-            try {
-                String format = extForName(dst.getName());
-                if (!ImageIO.write(img, format, dst)) {
-                    throw new IOException("No writer found for format: " + format);
-                }
-            } catch (Exception e) {
-                throw new IOException("Failed to write thumbnail: " + e.getMessage(), e);
-            }
-            return;
-        }
-        
-        // Calculate new dimensions
-        double ratio = (double) width / (double) w;
-        int nh = (int) Math.round(h * ratio);
 
-        try {
-            // Create thumbnail
-            Image tmp = img.getScaledInstance(width, nh, Image.SCALE_SMOOTH);
-            BufferedImage resized = new BufferedImage(width, nh, BufferedImage.TYPE_INT_RGB);
-            Graphics2D g2d = resized.createGraphics();
-            
-            // Improve quality
-            g2d.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, 
-                               java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g2d.setRenderingHint(java.awt.RenderingHints.KEY_RENDERING, 
-                               java.awt.RenderingHints.VALUE_RENDER_QUALITY);
-            
-            g2d.drawImage(tmp, 0, 0, null);
-            g2d.dispose();
-
-            String format = extForName(dst.getName());
-            if (!ImageIO.write(resized, format, dst)) {
-                throw new IOException("No writer found for format: " + format);
-            }
-        } catch (Exception e) {
-            throw new IOException("Failed to create thumbnail: " + e.getMessage(), e);
+        if (tryCommand(new String[]{
+                "ffmpeg", "-i", src.toString(), "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+                "-q:v", "3", "-y", dst.toString()
+        })) {
+            return true;
         }
+
+        if (tryCommand(new String[]{
+                "sips", "-Z", "320", src.toString(), "--out", dst.toString()
+        })) {
+            return true;
+        }
+
+        return false;
     }
 
-    private static String extForName(String name) {
-        String l = name.toLowerCase();
-        for (String e : EXT) {
-            if (l.endsWith("." + e)) {
-                return e.equals("jpeg") ? "jpg" : e;
-            }
+    private static boolean tryCommand(String[] cmd) {
+        try {
+            Process proc = new ProcessBuilder(cmd)
+                    .redirectErrorStream(true)
+                    .start();
+
+            int exitCode = proc.waitFor();
+            return exitCode == 0;
+        } catch (Exception e) {
+            return false;
         }
-        // default
-        return "jpg";
     }
 
     private static void writeResource(Path where, String content) throws IOException {
@@ -209,8 +161,8 @@ public class AzmaGall {
     private static void writeIndexHtml(Path where, String title, List<String> items) throws IOException {
         StringBuilder imgs = new StringBuilder();
         for (String n : items) {
-            imgs.append(String.format("    <a href=\"images/%s\" class=\"thumb\" data-full=\"images/%s\"><img src=\"thumbs/%s\" alt=\"%s\"></a>\n",
-                n, n, n, escapeHtml(n)));
+            imgs.append(String.format("    <a href=\"images/%s\" class=\"thumb\" data-full=\"images/%s\"><img src=\"thumbs/%s\" alt=\"%s\" loading=\"lazy\"></a>\n",
+                    n, n, n, escapeHtml(n)));
         }
 
         String html = "<!doctype html>\n" +
@@ -218,7 +170,6 @@ public class AzmaGall {
                 "<title>" + escapeHtml(title) + "</title>\n<link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n" +
                 "<header><h1>" + escapeHtml(title) + "</h1></header>\n" +
                 "<main class=\"grid\">\n" + imgs.toString() + "</main>\n" +
-                // lightbox container
                 "<div id=\"lightbox\" class=\"hidden\">\n<div id=\"lb-bg\"></div>\n<button id=\"prev\">◀</button><img id=\"lb-img\" src=\"\"><button id=\"next\">▶</button>\n</div>\n" +
                 "<script src=\"script.js\"></script>\n</body>\n</html>";
 
@@ -231,21 +182,24 @@ public class AzmaGall {
 
     private static String styleCss() {
         return "/* Minimal gallery CSS - responsive grid and lightbox */" +
-               "body{font-family: system-ui, -apple-system, Roboto, 'Segoe UI', sans-serif; margin:0; background:#111; color:#eee;}" +
-               "header{padding:12px 16px; text-align:center; background:#0d0d0d; box-shadow:0 1px 4px rgba(0,0,0,0.6);}" +
-               "h1{margin:0; font-size:1.1rem;}" +
-               ".grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; padding:12px;}" +
-               ".thumb{display:block; overflow:hidden; border-radius:6px; background:#222; border:1px solid rgba(255,255,255,0.03);}" +
-               ".thumb img{width:100%; height:100%; object-fit:cover; display:block;}" +
-               "#lightbox{position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:9999;}" +
-               "#lb-bg{position:absolute; inset:0; background:rgba(0,0,0,0.85);}" +
-               "#lb-img{max-width:95%; max-height:90%; z-index:10000; border-radius:6px; box-shadow:0 10px 30px rgba(0,0,0,0.7);}" +
-               "#prev,#next{position:fixed; top:50%; transform:translateY(-50%); z-index:10001; background:transparent; border:none; color:#fff; font-size:32px; cursor:pointer; padding:10px;}" +
-               "#prev{left:10px;} #next{right:10px;} .hidden{display:none;}";
+                "body{font-family: system-ui, -apple-system, Roboto, 'Segoe UI', sans-serif; margin:0; background:#111; color:#eee;}" +
+                "header{padding:12px 16px; text-align:center; background:#0d0d0d; box-shadow:0 1px 4px rgba(0,0,0,0.6);}" +
+                "h1{margin:0; font-size:1.1rem;}" +
+                ".grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; padding:12px; position:relative; z-index:1;}" +
+                ".thumb{display:block; overflow:hidden; border-radius:6px; background:#222; border:1px solid rgba(255,255,255,0.03); aspect-ratio:1; position:relative;}" +
+                ".thumb img{width:100%; height:100%; object-fit:cover; display:block; transition:transform 0.2s ease;}" +
+                ".thumb:hover img{transform:scale(1.05);}" +
+                "#lightbox{position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:9999; backdrop-filter:blur(4px);}" +
+                "#lightbox.hidden{display:none;}" +
+                "#lb-bg{position:absolute; inset:0; background:rgba(0,0,0,0.85);}" +
+                "#lb-img{max-width:95%; max-height:90%; z-index:10000; border-radius:6px; box-shadow:0 10px 30px rgba(0,0,0,0.7);}" +
+                "#prev,#next{position:fixed; top:50%; transform:translateY(-50%); z-index:10001; background:rgba(0,0,0,0.5); border:2px solid rgba(255,255,255,0.3); color:#fff; font-size:24px; cursor:pointer; padding:12px 16px; border-radius:50%; transition:all 0.2s ease;}" +
+                "#prev:hover,#next:hover{background:rgba(0,0,0,0.8); border-color:rgba(255,255,255,0.6);}" +
+                "#prev{left:20px;} #next{right:20px;}" +
+                "@media (max-width: 600px){.grid{grid-template-columns:repeat(auto-fill,minmax(100px,1fr)); gap:6px; padding:8px;} #prev{left:10px;} #next{right:10px;}}";
     }
 
     private static String scriptJs() {
-        // Lightweight JS: keyboard nav, click, touch swipe
         return "/* Minimal gallery JS */\n" +
                 "(function(){\n" +
                 "  const thumbs = Array.from(document.querySelectorAll('.thumb'));\n" +
@@ -254,15 +208,15 @@ public class AzmaGall {
                 "  const prevBtn = document.getElementById('prev');\n" +
                 "  const nextBtn = document.getElementById('next');\n" +
                 "  let idx = -1;\n" +
-                "  function openAt(i){ idx = (i+thumbs.length)%thumbs.length; lbImg.src = thumbs[idx].dataset.full; lb.classList.remove('hidden'); }\n" +
-                "  function closeLb(){ lb.classList.add('hidden'); lbImg.src=''; }\n" +
+                "  function openAt(i){ idx = (i+thumbs.length)%thumbs.length; lbImg.src = thumbs[idx].dataset.full; lb.classList.remove('hidden'); document.body.style.overflow='hidden'; }\n" +
+                "  function closeLb(){ lb.classList.add('hidden'); lbImg.src=''; document.body.style.overflow=''; }\n" +
                 "  function next(){ openAt(idx+1); }\n" +
                 "  function prev(){ openAt(idx-1); }\n" +
                 "  thumbs.forEach((t,i)=> t.addEventListener('click', e=>{ e.preventDefault(); openAt(i); }));\n" +
                 "  document.getElementById('lb-bg').addEventListener('click', closeLb);\n" +
                 "  nextBtn.addEventListener('click', e=>{ e.stopPropagation(); next(); });\n" +
                 "  prevBtn.addEventListener('click', e=>{ e.stopPropagation(); prev(); });\n" +
-                "  document.addEventListener('keydown', e=>{ if (lb.classList.contains('hidden')) return; if (e.key==='ArrowRight') next(); if (e.key==='ArrowLeft') prev(); if (e.key==='Escape') closeLb(); });\n" +
+                "  document.addEventListener('keydown', e=>{ if (lb.classList.contains('hidden')) return; if (e.key==='ArrowRight'||e.key===' ') next(); if (e.key==='ArrowLeft') prev(); if (e.key==='Escape') closeLb(); });\n" +
                 "  // touch swipe\n" +
                 "  let startX=0;\n" +
                 "  lbImg.addEventListener('touchstart', e=>{ startX = e.touches[0].clientX; });\n" +
