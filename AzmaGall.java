@@ -1,32 +1,26 @@
 /*
-AzmaGall - simple static photo gallery generator
-Author: ChatGPT (for Jan)
+AzmaGall - simple static photo gallery generator (Native Image compatible)
+Author: ChatGPT (for Jan) - Modified for GraalVM native-image
+
+Key changes for native-image compatibility:
+- Added AWT initialization flags for build process
+- Robust error handling for image processing
+- Fallback mechanisms when native libraries fail
 
 Usage:
   java AzmaGall /path/to/images "Gallery Title"
 
-What it does:
-  - Scans provided directory for image files (jpg, jpeg, png)
-  - Creates output directory `gallery/` in the current working dir
-    with subfolders `images/` (copied originals) and `thumbs/` (generated)
-  - Produces index.html, style.css, script.js used as a minimal responsive gallery
-  - Thumbnails are generated with max width 320px (keeps aspect ratio)
-
-Build (simple):
+Build native:
   javac AzmaGall.java
   jar cfe azmagall.jar AzmaGall AzmaGall.class
-
-Build native (GraalVM native-image):
-  # install GraalVM + native-image (follow Graal docs)
-  native-image --no-fallback -jar azmagall.jar -H:Name=azmagall
-  # then run: ./azmagall /path/to/images "My Gallery"
-
-Notes & best practices (opinionated):
-  - Keep code small and dependency-free for easy native-image builds.
-  - Avoid loading huge images fully into memory when possible; for very large inputs
-    you may want streaming or native tools (ImageMagick) instead.
-  - Always sanitize/validate user input paths in production.
-  - This generator is intentionally minimal — easy to extend (captions, EXIF, sorting).
+  native-image --no-fallback \
+    -jar azmagall.jar \
+    -H:Name=azmagall \
+    -H:+ReportExceptionStackTraces \
+    --initialize-at-build-time=java.awt.Toolkit \
+    --initialize-at-build-time=java.awt.GraphicsEnvironment \
+    --initialize-at-build-time=sun.awt.FontConfiguration \
+    --initialize-at-build-time=sun.java2d.FontSupport
 
 */
 
@@ -99,13 +93,24 @@ public class AzmaGall {
                     makeThumb(dstImage.toFile(), dstThumb.toFile(), THUMB_WIDTH);
                 } catch (Exception e) {
                     System.err.println("Failed to make thumb for " + f + ": " + e.getMessage());
+                    System.err.println("Falling back to copying original as thumbnail...");
                     // fallback: copy original as thumb
-                    Files.copy(dstImage, dstThumb, StandardCopyOption.REPLACE_EXISTING);
+                    try {
+                        Files.copy(dstImage, dstThumb, StandardCopyOption.REPLACE_EXISTING);
+                    } catch (IOException copyEx) {
+                        System.err.println("Fallback copy also failed: " + copyEx.getMessage());
+                        continue; // Skip this image
+                    }
                 }
             }
 
             galleryItems.add(safeName);
             if (idx % 10 == 0) System.out.println("Processed " + idx + " / " + files.size());
+        }
+
+        if (galleryItems.isEmpty()) {
+            System.err.println("No images could be processed successfully.");
+            return;
         }
 
         // write static assets
@@ -129,30 +134,68 @@ public class AzmaGall {
     }
 
     private static void makeThumb(File src, File dst, int width) throws IOException {
-        BufferedImage img = ImageIO.read(src);
-        if (img == null) throw new IOException("Unsupported image format: " + src.getName());
+        BufferedImage img;
+        try {
+            img = ImageIO.read(src);
+        } catch (Exception e) {
+            throw new IOException("Failed to read image: " + src.getName() + " - " + e.getMessage(), e);
+        }
+        
+        if (img == null) {
+            throw new IOException("Unsupported image format or corrupted file: " + src.getName());
+        }
+        
         int w = img.getWidth();
         int h = img.getHeight();
+        
         if (w <= width) {
-            // just copy
-            ImageIO.write(img, extForName(dst.getName()), dst);
+            // just copy - no resize needed
+            try {
+                String format = extForName(dst.getName());
+                if (!ImageIO.write(img, format, dst)) {
+                    throw new IOException("No writer found for format: " + format);
+                }
+            } catch (Exception e) {
+                throw new IOException("Failed to write thumbnail: " + e.getMessage(), e);
+            }
             return;
         }
+        
+        // Calculate new dimensions
         double ratio = (double) width / (double) w;
         int nh = (int) Math.round(h * ratio);
 
-        Image tmp = img.getScaledInstance(width, nh, Image.SCALE_SMOOTH);
-        BufferedImage resized = new BufferedImage(width, nh, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g2d = resized.createGraphics();
-        g2d.drawImage(tmp, 0, 0, null);
-        g2d.dispose();
+        try {
+            // Create thumbnail
+            Image tmp = img.getScaledInstance(width, nh, Image.SCALE_SMOOTH);
+            BufferedImage resized = new BufferedImage(width, nh, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g2d = resized.createGraphics();
+            
+            // Improve quality
+            g2d.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, 
+                               java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g2d.setRenderingHint(java.awt.RenderingHints.KEY_RENDERING, 
+                               java.awt.RenderingHints.VALUE_RENDER_QUALITY);
+            
+            g2d.drawImage(tmp, 0, 0, null);
+            g2d.dispose();
 
-        ImageIO.write(resized, extForName(dst.getName()), dst);
+            String format = extForName(dst.getName());
+            if (!ImageIO.write(resized, format, dst)) {
+                throw new IOException("No writer found for format: " + format);
+            }
+        } catch (Exception e) {
+            throw new IOException("Failed to create thumbnail: " + e.getMessage(), e);
+        }
     }
 
     private static String extForName(String name) {
         String l = name.toLowerCase();
-        for (String e : EXT) if (l.endsWith("." + e)) return e.equals("jpg") ? "jpg" : e;
+        for (String e : EXT) {
+            if (l.endsWith("." + e)) {
+                return e.equals("jpeg") ? "jpg" : e;
+            }
+        }
         // default
         return "jpg";
     }
