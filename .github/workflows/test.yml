@@ -1,0 +1,29 @@
+name: Test Build
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup GraalVM
+      uses: graalvm/setup-graalvm@v1
+      with:
+        java-version: '21'
+        distribution: 'graalvm'
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Compile and test
+      run: |
+        javac AzmaGall.java
+        java AzmaGall || echo "Expected error - no arguments provided"
+        jar cfe azmagall.jar AzmaGall AzmaGall.class
+        java -jar azmagall.jar || echo "Expected error - no arguments provided"

@@ -1,57 +1,108 @@
 name: Build and Release
 
 on:
-  workflow_dispatch:
   push:
     tags:
-      - "v*"
+      - 'v*'  # Spustí se při push tagu jako v1.0.0
+  workflow_dispatch:  # Možnost spustit ručně
 
 jobs:
-  build-linux:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+            binary_name: azmagall-linux-x64
+          - os: macos-latest
+            platform: macos
+            arch: aarch64
+            binary_name: azmagall-macos-aarch64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup GraalVM
+      uses: graalvm/setup-graalvm@v1
+      with:
+        java-version: '21'
+        distribution: 'graalvm'
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        native-image-job-reports: 'true'
+
+    - name: Build JAR
+      run: |
+        javac AzmaGall.java
+        jar cfe azmagall.jar AzmaGall AzmaGall.class
+
+    - name: Build native image (Linux)
+      if: matrix.platform == 'linux'
+      run: |
+        native-image --no-fallback \
+          --static \
+          -jar azmagall.jar \
+          -H:Name=${{ matrix.binary_name }} \
+          -H:+ReportExceptionStackTraces
+
+    - name: Build native image (macOS)
+      if: matrix.platform == 'macos'
+      run: |
+        native-image --no-fallback \
+          -jar azmagall.jar \
+          -H:Name=${{ matrix.binary_name }} \
+          -H:+ReportExceptionStackTraces
+
+    - name: Test binary
+      run: |
+        ./${{ matrix.binary_name }} || true  # Test že se spustí (očekáváme chybu kvůli chybějícím argumentům)
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.binary_name }}
+        path: ${{ matrix.binary_name }}
+
+  create-release:
+    needs: build
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
     steps:
-      - uses: actions/checkout@v4
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./binaries
 
-      - name: Build Linux binary
-        run: |
-          mkdir dist
-          echo "Linux build here" > dist/myapp-linux
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-binary
-          path: dist/myapp-linux
+    - name: Upload Linux Binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./binaries/azmagall-linux-x64/azmagall-linux-x64
+        asset_name: azmagall-linux-x64
+        asset_content_type: application/octet-stream
 
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build macOS binary
-        run: |
-          mkdir dist
-          echo "Mac build here" > dist/myapp-macos
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mac-binary
-          path: dist/myapp-macos
-
-  release:
-    needs: [build-linux, build-macos]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: linux-binary
-          path: ./dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: mac-binary
-          path: ./dist
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Upload macOS Binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./binaries/azmagall-macos-aarch64/azmagall-macos-aarch64
+        asset_name: azmagall-macos-aarch64
+        asset_content_type: application/octet-stream
